@@ -77,7 +77,7 @@
 // words MODEL, IOS, UA, RESULTS and COMMENTS when making the link (see README.md).
 const FORM_PREFILL = 'https://docs.google.com/forms/d/e/1FAIpQLSctc0D10sy7fadOd2EMGf5mCIIEtim1DKLdXp_jSptzZ_Tl2w/viewform?usp=pp_url&entry.1295353450=MODEL&entry.1096035214=IOS&entry.847857977=UA&entry.160855553=RESULTS&entry.1203418752=COMMENTS';
 
-const APP_VERSION = 'iphone-test 1';
+const APP_VERSION = 'iphone-test 2';
 const params = new URLSearchParams(location.search);
 const CHIRP_MS = parseFloat(params.get('chirpMs')) || 10;
 const CLICK_GAIN = 0.9;
@@ -115,7 +115,8 @@ const TESTS = [
     detail: 'As D, but the mic track is disabled (track.enabled = false) during the clicks.',
     mic: 'raw', after: 'play-and-record', play: 'webaudio', during: 'disabled' },
   { id: 'H', name: 'Mic stopped while playing',
-    detail: 'As D, but the mic is stopped during the clicks and reopened after (reopen time is measured).',
+    detail: 'As D, but the mic is stopped during the clicks, then reopened. You will hear faint ticks, ' +
+            'then the clicks, then faint ticks again: rate the clicks in the middle. Takes about 15 s.',
     mic: 'raw', after: 'play-and-record', play: 'webaudio', during: 'stopped' },
   { id: 'R2', name: 'Reference again',
     detail: 'Same as the first test. If this is now quiet, the phone got stuck: reload, then play this again.',
@@ -220,19 +221,19 @@ function makeSweep(startHz, endHz, durationMs, sampleRate) {
   return wave;
 }
 
-// CLICK_COUNT clicks, 350-650 ms apart at random.
-function makeTrain(sampleRate) {
+// "count" clicks, 350-650 ms apart at random.
+function makeTrain(sampleRate, gain = CLICK_GAIN, count = CLICK_COUNT) {
   const chirp = makeSweep(2500, 5500, CHIRP_MS, sampleRate);
   const starts = [];
   let t = 0.3;
-  for (let i = 0; i < CLICK_COUNT; i++) {
+  for (let i = 0; i < count; i++) {
     starts.push(Math.round(t * sampleRate));
     t += 0.35 + Math.random() * 0.3;
   }
   const n = starts[starts.length - 1] + chirp.length + Math.round(0.3 * sampleRate);
   const samples = new Float32Array(n);
   for (const s of starts) {
-    for (let i = 0; i < chirp.length; i++) samples[s + i] += chirp[i] * CLICK_GAIN;
+    for (let i = 0; i < chirp.length; i++) samples[s + i] += chirp[i] * gain;
   }
   return { samples, starts, chirp, sampleRate };
 }
@@ -264,13 +265,15 @@ function makeWavUrl(samples, sampleRate) {
 // 2. Try every offset d between the recording and the click train and add up
 //    the correlation at all 8 click positions. Only our own random spacing
 //    gives a high total at a single offset.
-function analyse(rec, train) {
+// Returns { error } or { heard, total, match, levelDb, offset }, where offset
+// is the index in "rec" where the train's first sample landed.
+function findTrain(rec, train) {
   const t = train.chirp;
   const m = t.length;
-  if (rec.length < train.samples.length) return 'recording too short';
+  if (rec.length < train.samples.length) return { error: 'recording too short' };
   let peak = 0;
   for (let i = 0; i < rec.length; i++) peak = Math.max(peak, Math.abs(rec[i]));
-  if (peak < 1e-6) return 'mic silent';
+  if (peak < 1e-6) return { error: 'mic silent' };
 
   let tEnergy = 0;
   for (let i = 0; i < m; i++) tEnergy += t[i] * t[i];
@@ -308,8 +311,15 @@ function analyse(rec, train) {
       levels.push(10 * Math.log10(energy[s] / m + 1e-12));
     }
   }
-  let text = 'heard ' + heard + '/' + starts.length + ', match ' + median(corrs).toFixed(2);
-  if (levels.length > 0) text += ', ' + median(levels).toFixed(0) + ' dB';
+  return { heard: heard, total: starts.length, match: median(corrs),
+           levelDb: levels.length > 0 ? median(levels) : null, offset: bestD };
+}
+
+function analyse(rec, train) {
+  const f = findTrain(rec, train);
+  if (f.error) return f.error;
+  let text = 'heard ' + f.heard + '/' + f.total + ', match ' + f.match.toFixed(2);
+  if (f.levelDb !== null) text += ', ' + f.levelDb.toFixed(0) + ' dB';
   return text;
 }
 
@@ -369,16 +379,24 @@ function setTracksEnabled(on) {
 }
 
 // ScriptProcessorNode is old but works everywhere and needs no extra file.
+// Each block also gets a context time (playbackTime), so test H can say when
+// a click was recorded. That time has a fixed unknown offset, which cancels
+// out when comparing before and after.
 function startRecording() {
   const source = ctx.createMediaStreamSource(micStream);
   const node = ctx.createScriptProcessor(4096, 1, 1);
   const chunks = [];
-  node.onaudioprocess = e => { chunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+  const times = [];
+  node.onaudioprocess = e => {
+    chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+    times.push(typeof e.playbackTime === 'number' ? e.playbackTime : ctx.currentTime);
+  };
   source.connect(node);
   node.connect(ctx.destination); // outputs silence; needed for it to run
-  recorder = { source, node, chunks };
+  recorder = { source, node, chunks, times };
 }
 
+// Returns { samples, t0: context time of samples[0], gaps: blocks that did not follow on }
 function stopRecording() {
   if (!recorder) return null;
   const r = recorder;
@@ -389,8 +407,14 @@ function stopRecording() {
   for (const c of r.chunks) n += c.length;
   const all = new Float32Array(n);
   let o = 0;
-  for (const c of r.chunks) { all.set(c, o); o += c.length; }
-  return all;
+  let gaps = 0;
+  const t0 = r.times.length > 0 ? r.times[0] : 0;
+  for (let j = 0; j < r.chunks.length; j++) {
+    if (Math.abs(r.times[j] - (t0 + o / ctx.sampleRate)) > 0.001) gaps++;
+    all.set(r.chunks[j], o);
+    o += r.chunks[j].length;
+  }
+  return { samples: all, t0: t0, gaps: gaps };
 }
 
 function waitForEvent(target, name, timeoutMs) {
@@ -413,11 +437,12 @@ function makeBufferSource(train) {
   return src;
 }
 
-async function playWebAudio(train) {
+// when: context time to start at (0 = now)
+async function playWebAudio(train, when = 0) {
   const src = makeBufferSource(train);
   src.connect(ctx.destination);
   const ended = waitForEvent(src, 'ended', trainMs(train) + 3000);
-  src.start();
+  src.start(when);
   await ended;
 }
 
@@ -491,11 +516,16 @@ async function runTest(t, oldCtx) {
   if (t.after) setSession(t.after);
   r.session = sessionType();
 
+  if (t.during === 'stopped') {
+    await runTimingTest(t, r);
+    setStatus(t.id, 'Done – how loud were the middle clicks?');
+    return;
+  }
+
   const train = makeTrain(ctx.sampleRate);
   const listening = t.mic && t.during === 'on';
   if (listening) startRecording();
   if (t.during === 'disabled') setTracksEnabled(false);
-  if (t.during === 'stopped') stopMic();
   await waitMs(200);
 
   setStatus(t.id, 'Playing – listen!');
@@ -508,19 +538,131 @@ async function runTest(t, oldCtx) {
     const rec = stopRecording();
     setStatus(t.id, 'Checking what the mic heard…');
     await waitMs(30); // let the screen update first
-    r.listen = analyse(rec, train);
+    r.listen = analyse(rec.samples, train);
   }
   if (t.during === 'disabled') {
     setTracksEnabled(true);
     r.listen = 'n/a (mic paused)';
   }
-  if (t.during === 'stopped') {
-    const t0 = performance.now();
-    micStream = await openMic(true);
-    r.note = 'mic reopened in ' + Math.round(performance.now() - t0) + ' ms';
-    r.listen = 'n/a (mic stopped)';
-  }
   setStatus(t.id, 'Done – how loud was it?');
+}
+
+
+// ---------------------------------------------------------------------
+// Test H: does stopping and reopening the mic upset the timing?
+// ---------------------------------------------------------------------
+// The main app places chirps by audio frame and converts frames to clock
+// time with getOutputTimestamp(). If iOS rebuilds its audio setup when the
+// mic stops or reopens, that conversion can jump, the context can pause, and
+// the speaker->mic delay can change. One AudioContext runs the whole test:
+//   1. mic on:       faint ticks, recorded, to measure the speaker->mic delay
+//   2. mic stopped:  the normal clicks the student rates
+//   3. mic reopened: faint ticks again, delay measured again
+// All along, a monitor reads getOutputTimestamp() every 50 ms.
+
+function startMonitor() {
+  const mon = { phase: 'on', readings: [], states: [], t0: performance.now(), fallback: false };
+  ctx.onstatechange = () => {
+    mon.states.push(ctx.state + '@' + ((performance.now() - mon.t0) / 1000).toFixed(1) + 's');
+  };
+  mon.timer = setInterval(() => {
+    let contextTime = 0;
+    let perfTime = 0;
+    if (ctx.getOutputTimestamp) {
+      const stamp = ctx.getOutputTimestamp();
+      contextTime = stamp.contextTime;
+      perfTime = stamp.performanceTime;
+    }
+    if (!contextTime || !perfTime) {
+      contextTime = ctx.currentTime - (ctx.outputLatency || ctx.baseLatency || 0);
+      perfTime = performance.now();
+      mon.fallback = true;
+    }
+    // How far the audio clock is ahead of the page clock. If this drops by
+    // X ms, chirps placed with the old value would come out X ms late.
+    mon.readings.push({ phase: mon.phase, offsetMs: contextTime * 1000 - perfTime });
+  }, 50);
+  return mon;
+}
+
+function stopMonitor(mon) {
+  clearInterval(mon.timer);
+  ctx.onstatechange = null;
+}
+
+function latencyText() {
+  const ms = x => (typeof x === 'number' ? (x * 1000).toFixed(1) : '?');
+  return 'out ' + ms(ctx.outputLatency) + '/base ' + ms(ctx.baseLatency);
+}
+
+// Faint ticks with the mic on; returns the apparent speaker->mic delay in ms, or null.
+async function measureLoopback() {
+  const train = makeTrain(ctx.sampleRate, 0.3, 5);
+  startRecording();
+  const when = ctx.currentTime + 0.3;
+  await playWebAudio(train, when);
+  await waitMs(400);
+  const rec = stopRecording();
+  const f = findTrain(rec.samples, train);
+  if (f.error) return { ms: null, text: f.error, gaps: rec.gaps };
+  if (f.heard < 3) return { ms: null, text: 'heard ' + f.heard + '/5', gaps: rec.gaps };
+  const ms = (rec.t0 + f.offset / ctx.sampleRate - when) * 1000;
+  return { ms: ms, text: ms.toFixed(1) + ' ms', gaps: rec.gaps };
+}
+
+async function runTimingTest(t, r) {
+  const mon = startMonitor();
+  const states = [ctx.state];
+  const latBefore = latencyText();
+  setStatus(t.id, 'Faint ticks (mic on)…');
+  await waitMs(800);
+  const before = await measureLoopback();
+
+  mon.phase = 'stopped';
+  stopMic();
+  await waitMs(200);
+  setStatus(t.id, 'Playing – listen!');
+  await playWebAudio(makeTrain(ctx.sampleRate));
+  await waitMs(200);
+
+  setStatus(t.id, 'Reopening the mic…');
+  const t0 = performance.now();
+  micStream = await openMic(true);
+  const reopenMs = performance.now() - t0;
+  if (t.after) setSession(t.after);
+  mon.phase = 'reopened';
+  const latAfter = latencyText();
+  setStatus(t.id, 'Faint ticks (mic reopened)…');
+  await waitMs(800);
+  const after = await measureLoopback();
+  stopMonitor(mon);
+
+  r.listen = 'n/a (mic stopped)';
+  r.note = 'reopen ' + Math.round(reopenMs) + ' ms; ' + timingSummary(mon, before, after) +
+           '; states ' + states.concat(mon.states).join(',') +
+           '; latency ' + latBefore + ' -> ' + latAfter + ' ms; rate ' + ctx.sampleRate;
+}
+
+function timingSummary(mon, before, after) {
+  let text = 'mic delay ' + before.text + ' -> ' + after.text;
+  if (before.ms !== null && after.ms !== null) {
+    const change = after.ms - before.ms;
+    text += ' (' + (change >= 0 ? '+' : '') + change.toFixed(1) + ')';
+  }
+  if (before.gaps + after.gaps > 0) text += ', rec gaps ' + before.gaps + '+' + after.gaps;
+
+  const byPhase = { on: [], stopped: [], reopened: [] };
+  for (const x of mon.readings) byPhase[x.phase].push(x.offsetMs);
+  if (byPhase.on.length < 5) return text + '; clock: too few readings';
+  const base = median(byPhase.on);
+  const late = phase => (byPhase[phase].length > 0 ? (base - median(byPhase[phase])).toFixed(1) : '?');
+  let worst = 0;
+  for (const x of mon.readings) worst = Math.max(worst, Math.abs(base - x.offsetMs));
+  const onSpread = Math.max(...byPhase.on) - Math.min(...byPhase.on);
+  text += '; chirps late by: stopped ' + late('stopped') + ', reopened ' + late('reopened') +
+          ' ms (worst single reading ' + worst.toFixed(1) + ', mic-on spread ' + onSpread.toFixed(1) + ')';
+  if (mon.fallback) text += ' [no getOutputTimestamp]';
+  return text;
 }
 
 
