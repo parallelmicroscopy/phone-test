@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>iPhone speaker test</title>
+<style>
+  body { margin: 0; padding: 16px; font-family: system-ui, -apple-system, sans-serif; font-size: 17px;
+         background: #f4f4f4; color: #111; max-width: 640px; }
+  h1 { font-size: 22px; margin: 0 0 10px 0; }
+  .card { background: #fff; border-radius: 12px; padding: 12px; margin: 10px 0; box-shadow: 0 1px 3px rgba(0,0,0,.12); }
+  .card ol { margin: 0; padding-left: 22px; }
+  .head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .detail { font-size: 14px; color: #555; margin: 4px 0; }
+  .status { font-size: 14px; color: #0a5; min-height: 1.2em; }
+  .listen { font-size: 13px; color: #444; font-family: ui-monospace, Menlo, monospace; }
+  .rate { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 6px; }
+  .rate label { white-space: nowrap; }
+  button { font-size: 18px; padding: 10px 18px; border-radius: 10px; border: 0; background: #0a66d8; color: #fff; }
+  button:disabled { background: #999; }
+  input[type=text], textarea { width: 100%; box-sizing: border-box; font-size: 17px; padding: 6px; margin-top: 4px; }
+  input[type=radio], input[type=checkbox] { transform: scale(1.3); margin-right: 6px; }
+  .done { border-left: 6px solid #0a5; }
+  pre { white-space: pre-wrap; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<h1>iPhone speaker test</h1>
+
+<div class="card">
+  <ol>
+    <li>Ringer switch <b>ON</b> (not silent), volume <b>all the way up</b>.</li>
+    <li>Hold the phone at arm's length.</li>
+    <li>Tap <b>Play</b> on each test, from top to bottom. Listen to the clicks, then pick
+        what you heard.</li>
+    <li>If Safari asks for the microphone, tap <b>Allow</b>.</li>
+    <li>At the end, tap <b>Send results</b>.</li>
+  </ol>
+</div>
+
+<div class="card">
+  <div>Model guess: <b id="guess"></b></div>
+  <label>Exact model (Settings › General › About › Model Name)
+    <input id="model" type="text" autocomplete="off"></label>
+  <div style="margin-top:6px">iOS: <b id="ios"></b></div>
+</div>
+
+<div id="tests"></div>
+
+<div class="card">
+  <button id="reloadBtn">Reload page</button>
+  <div class="detail">Your answers are kept. If every test after one of them is quiet,
+    reload and carry on from the next test.</div>
+</div>
+
+<div class="card">
+  <label>Comments (optional)<textarea id="comments" rows="2"></textarea></label>
+  <button id="sendBtn" style="margin-top:8px">Send results</button>
+  <pre id="summary"></pre>
+</div>
+
+<script>
+// =====================================================================
+// iPhone speaker test
+// =====================================================================
+// iPhones play sound very quietly once a page has the microphone open.
+// Each test below opens the microphone in a different way, plays 8 clicks
+// (the same chirp as the main app), and asks the student how loud it was.
+// While the clicks play, the page also records the microphone and checks
+// whether it heard its own clicks ("listen" result).
+//
+// The clicks are spaced randomly, and the listen check looks for that exact
+// spacing, so other phones clicking nearby are not mistaken for our own.
+
+// Paste the Google Form "pre-filled link" here. Fill the form's fields with the
+// words MODEL, IOS, UA, RESULTS and COMMENTS when making the link (see README.md).
+const FORM_PREFILL = 'https://docs.google.com/forms/d/e/1FAIpQLSctc0D10sy7fadOd2EMGf5mCIIEtim1DKLdXp_jSptzZ_Tl2w/viewform?usp=pp_url&entry.1295353450=MODEL&entry.1096035214=IOS&entry.847857977=UA&entry.160855553=RESULTS&entry.1203418752=COMMENTS';
+
+const APP_VERSION = 'iphone-test 1';
+const params = new URLSearchParams(location.search);
+const CHIRP_MS = parseFloat(params.get('chirpMs')) || 10;
+const CLICK_GAIN = 0.9;
+const CLICK_COUNT = 8;
+const MATCH_THRESHOLD = 0.4;
+
+// mic:    null (no microphone), 'default' ({audio: true}) or 'raw' (voice processing off)
+// before: audioSession.type to set before opening the microphone
+// after:  audioSession.type to set after opening the microphone
+// play:   'webaudio', 'element' (<audio> playing a WAV) or 'streamdest' (Web Audio -> <audio>)
+// during: what the microphone does while the clicks play: 'on', 'disabled' or 'stopped'
+const TESTS = [
+  { id: 'R1', name: 'Reference: microphone off',
+    detail: 'Microphone off. This is what "loud" sounds like.',
+    mic: null, play: 'webaudio' },
+  { id: 'A', name: 'Mic on, browser defaults',
+    detail: 'getUserMedia({audio: true}), nothing else.',
+    mic: 'default', play: 'webaudio', during: 'on' },
+  { id: 'B', name: 'Mic on, voice processing off',
+    detail: 'Echo cancellation, noise suppression and auto gain all off.',
+    mic: 'raw', play: 'webaudio', during: 'on' },
+  { id: 'C', name: 'play-and-record before mic',
+    detail: "audioSession.type = 'play-and-record', then open the mic as in B.",
+    mic: 'raw', before: 'play-and-record', play: 'webaudio', during: 'on' },
+  { id: 'D', name: 'Kick order',
+    detail: "'auto', open the mic as in B, then 'play-and-record'. This is what v2 uses.",
+    mic: 'raw', after: 'play-and-record', play: 'webaudio', during: 'on' },
+  { id: 'E', name: 'Kick + <audio> element',
+    detail: 'As D, but the clicks play from an <audio> element (a WAV file).',
+    mic: 'raw', after: 'play-and-record', play: 'element', during: 'on' },
+  { id: 'F', name: 'Kick + Web Audio into <audio>',
+    detail: 'As D, but Web Audio is routed through a MediaStreamDestination into an <audio> element.',
+    mic: 'raw', after: 'play-and-record', play: 'streamdest', during: 'on' },
+  { id: 'G', name: 'Mic paused while playing',
+    detail: 'As D, but the mic track is disabled (track.enabled = false) during the clicks.',
+    mic: 'raw', after: 'play-and-record', play: 'webaudio', during: 'disabled' },
+  { id: 'H', name: 'Mic stopped while playing',
+    detail: 'As D, but the mic is stopped during the clicks and reopened after (reopen time is measured).',
+    mic: 'raw', after: 'play-and-record', play: 'webaudio', during: 'stopped' },
+  { id: 'R2', name: 'Reference again',
+    detail: 'Same as the first test. If this is now quiet, the phone got stuck: reload, then play this again.',
+    mic: null, play: 'webaudio' }
+];
+
+
+// ---------------------------------------------------------------------
+// Saved answers (kept across reloads)
+// ---------------------------------------------------------------------
+const STORE_KEY = 'iphoneSpeakerTest.v1';
+let state = { model: '', comments: '', results: {} };
+
+function load() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(STORE_KEY));
+    if (saved && saved.results) state = saved;
+  } catch (e) { /* no storage: answers are just not kept */ }
+}
+
+function save() {
+  try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch (e) { }
+}
+
+function resultFor(id) {
+  if (!state.results[id]) state.results[id] = { rating: '', ear: false, listen: '', note: '' };
+  return state.results[id];
+}
+
+
+// ---------------------------------------------------------------------
+// Phone and iOS version
+// ---------------------------------------------------------------------
+// Safari only says "iPhone", so the model is guessed from the screen size
+// (in CSS pixels, portrait) and pixel density. Display Zoom changes these.
+const SCREEN_MODELS = [
+  [320, 568, 2, 'iPhone SE (1st gen) / 5s'],
+  [375, 667, 2, 'iPhone 6/6s/7/8 or SE (2nd/3rd gen)'],
+  [414, 736, 3, 'iPhone 6/6s/7/8 Plus'],
+  [375, 812, 3, 'iPhone X/XS/11 Pro or 12/13 mini'],
+  [414, 896, 2, 'iPhone XR or 11'],
+  [414, 896, 3, 'iPhone XS Max or 11 Pro Max'],
+  [390, 844, 3, 'iPhone 12/12 Pro/13/13 Pro/14/16e'],
+  [428, 926, 3, 'iPhone 12 Pro Max/13 Pro Max/14 Plus'],
+  [393, 852, 3, 'iPhone 14 Pro/15/15 Pro/16'],
+  [430, 932, 3, 'iPhone 14 Pro Max/15 Plus/15 Pro Max/16 Plus'],
+  [402, 874, 3, 'iPhone 16 Pro/17/17 Pro'],
+  [420, 912, 3, 'iPhone Air'],
+  [440, 956, 3, 'iPhone 16 Pro Max/17 Pro Max']
+];
+
+function guessModel() {
+  const w = Math.min(screen.width, screen.height);
+  const h = Math.max(screen.width, screen.height);
+  const dpr = Math.round(window.devicePixelRatio || 1);
+  for (const m of SCREEN_MODELS) {
+    if (m[0] === w && m[1] === h && m[2] === dpr) return m[3];
+  }
+  return 'unknown (' + w + '×' + h + ' @' + dpr + 'x)';
+}
+
+// From iOS 26, Safari freezes the "OS 18_6" part of its user agent, but its
+// "Version/26.x" part still follows iOS. Other iOS browsers (Chrome, Firefox)
+// have no Version part.
+function iosVersion() {
+  const ua = navigator.userAgent;
+  const os = ua.match(/OS (\d+)_(\d+)(?:_(\d+))? like Mac OS X/);
+  const safari = ua.match(/Version\/(\d+(?:\.\d+)*)/);
+  let text;
+  if (safari && parseInt(safari[1], 10) >= 26) {
+    text = safari[1];
+  } else if (os) {
+    text = os[1] + '.' + os[2] + (os[3] ? '.' + os[3] : '');
+  } else {
+    text = 'not iOS?';
+  }
+  let browser = 'Safari';
+  if (/CriOS/.test(ua)) browser = 'Chrome';
+  else if (/FxiOS/.test(ua)) browser = 'Firefox';
+  else if (/EdgiOS/.test(ua)) browser = 'Edge';
+  else if (!safari) browser = 'other/in-app';
+  return text + ', ' + browser + ', audioSession API: ' + ('audioSession' in navigator ? 'yes' : 'no');
+}
+
+
+// ---------------------------------------------------------------------
+// Sounds
+// ---------------------------------------------------------------------
+// A rising sweep from 2.5 to 5.5 kHz, as in the main app.
+function makeSweep(startHz, endHz, durationMs, sampleRate) {
+  const n = Math.round(sampleRate * durationMs / 1000);
+  const wave = new Float32Array(n);
+  const fade = Math.max(1, Math.round(n * 0.1));
+  let phase = 0;
+  for (let i = 0; i < n; i++) {
+    phase += 2 * Math.PI * (startHz + (endHz - startHz) * i / n) / sampleRate;
+    let env = 1;
+    if (i < fade) env = 0.5 - 0.5 * Math.cos(Math.PI * i / fade);
+    else if (i >= n - fade) env = 0.5 - 0.5 * Math.cos(Math.PI * (n - 1 - i) / fade);
+    wave[i] = Math.sin(phase) * env;
+  }
+  return wave;
+}
+
+// CLICK_COUNT clicks, 350-650 ms apart at random.
+function makeTrain(sampleRate) {
+  const chirp = makeSweep(2500, 5500, CHIRP_MS, sampleRate);
+  const starts = [];
+  let t = 0.3;
+  for (let i = 0; i < CLICK_COUNT; i++) {
+    starts.push(Math.round(t * sampleRate));
+    t += 0.35 + Math.random() * 0.3;
+  }
+  const n = starts[starts.length - 1] + chirp.length + Math.round(0.3 * sampleRate);
+  const samples = new Float32Array(n);
+  for (const s of starts) {
+    for (let i = 0; i < chirp.length; i++) samples[s + i] += chirp[i] * CLICK_GAIN;
+  }
+  return { samples, starts, chirp, sampleRate };
+}
+
+// 16-bit mono WAV file, as a blob: URL an <audio> element can play.
+function makeWavUrl(samples, sampleRate) {
+  const n = samples.length;
+  const buf = new ArrayBuffer(44 + n * 2);
+  const v = new DataView(buf);
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  str(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); str(8, 'WAVE');
+  str(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, sampleRate, true); v.setUint32(28, sampleRate * 2, true);
+  v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  str(36, 'data'); v.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) {
+    const x = Math.max(-1, Math.min(1, samples[i]));
+    v.setInt16(44 + i * 2, x < 0 ? x * 0x8000 : x * 0x7fff, true);
+  }
+  return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+}
+
+
+// ---------------------------------------------------------------------
+// Listen check: did the microphone hear our own clicks?
+// ---------------------------------------------------------------------
+// 1. Normalized cross-correlation of the recording with the chirp at every
+//    position (1 = same shape, whatever the loudness).
+// 2. Try every offset d between the recording and the click train and add up
+//    the correlation at all 8 click positions. Only our own random spacing
+//    gives a high total at a single offset.
+function analyse(rec, train) {
+  const t = train.chirp;
+  const m = t.length;
+  if (rec.length < train.samples.length) return 'recording too short';
+  let peak = 0;
+  for (let i = 0; i < rec.length; i++) peak = Math.max(peak, Math.abs(rec[i]));
+  if (peak < 1e-6) return 'mic silent';
+
+  let tEnergy = 0;
+  for (let i = 0; i < m; i++) tEnergy += t[i] * t[i];
+  const corrLen = rec.length - m + 1;
+  const corr = new Float32Array(corrLen);
+  const energy = new Float32Array(corrLen);
+  let e = 0;
+  for (let i = 0; i < m; i++) e += rec[i] * rec[i];
+  for (let s = 0; s < corrLen; s++) {
+    if (s > 0) e += rec[s + m - 1] * rec[s + m - 1] - rec[s - 1] * rec[s - 1];
+    let dot = 0;
+    for (let i = 0; i < m; i++) dot += rec[s + i] * t[i];
+    energy[s] = Math.max(e, 0);
+    corr[s] = energy[s] > 1e-12 ? dot / Math.sqrt(energy[s] * tEnergy) : 0;
+  }
+
+  const starts = train.starts;
+  const lastStart = starts[starts.length - 1];
+  let bestD = 0;
+  let bestScore = -Infinity;
+  for (let d = 0; d + lastStart < corrLen; d++) {
+    let score = 0;
+    for (let k = 0; k < starts.length; k++) score += corr[starts[k] + d];
+    if (score > bestScore) { bestScore = score; bestD = d; }
+  }
+
+  let heard = 0;
+  const corrs = [];
+  const levels = [];
+  for (let k = 0; k < starts.length; k++) {
+    const s = starts[k] + bestD;
+    corrs.push(corr[s]);
+    if (corr[s] >= MATCH_THRESHOLD) {
+      heard++;
+      levels.push(10 * Math.log10(energy[s] / m + 1e-12));
+    }
+  }
+  let text = 'heard ' + heard + '/' + starts.length + ', match ' + median(corrs).toFixed(2);
+  if (levels.length > 0) text += ', ' + median(levels).toFixed(0) + ' dB';
+  return text;
+}
+
+function median(values) {
+  const c = values.slice().sort((a, b) => a - b);
+  const mid = Math.floor(c.length / 2);
+  return c.length % 2 ? c[mid] : (c[mid - 1] + c[mid]) / 2;
+}
+
+
+// ---------------------------------------------------------------------
+// Audio plumbing
+// ---------------------------------------------------------------------
+let ctx = null;          // AudioContext (a new one for every test)
+let micStream = null;
+let recorder = null;     // { source, node, chunks }
+const el = document.createElement('audio');
+el.setAttribute('playsinline', '');
+let elUnlocked = false;
+
+const waitMs = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+function setSession(type) {
+  if ('audioSession' in navigator) {
+    try { navigator.audioSession.type = type; } catch (e) { }
+  }
+}
+
+function sessionType() {
+  return 'audioSession' in navigator ? navigator.audioSession.type : 'n/a';
+}
+
+// iOS only lets an <audio> element play if it first played inside a tap.
+function unlockElement() {
+  if (elUnlocked) return;
+  el.src = makeWavUrl(new Float32Array(2400), 48000);
+  const p = el.play();
+  if (p) p.then(() => el.pause()).catch(() => { });
+  elUnlocked = true;
+}
+
+async function openMic(raw) {
+  const audio = raw ? { echoCancellation: false, noiseSuppression: false, autoGainControl: false } : true;
+  return navigator.mediaDevices.getUserMedia({ audio: audio, video: false });
+}
+
+function stopMic() {
+  stopRecording();
+  if (micStream) {
+    micStream.getTracks().forEach(track => track.stop());
+    micStream = null;
+  }
+}
+
+function setTracksEnabled(on) {
+  if (micStream) micStream.getTracks().forEach(track => { track.enabled = on; });
+}
+
+// ScriptProcessorNode is old but works everywhere and needs no extra file.
+function startRecording() {
+  const source = ctx.createMediaStreamSource(micStream);
+  const node = ctx.createScriptProcessor(4096, 1, 1);
+  const chunks = [];
+  node.onaudioprocess = e => { chunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+  source.connect(node);
+  node.connect(ctx.destination); // outputs silence; needed for it to run
+  recorder = { source, node, chunks };
+}
+
+function stopRecording() {
+  if (!recorder) return null;
+  const r = recorder;
+  recorder = null;
+  try { r.source.disconnect(); r.node.disconnect(); } catch (e) { }
+  r.node.onaudioprocess = null;
+  let n = 0;
+  for (const c of r.chunks) n += c.length;
+  const all = new Float32Array(n);
+  let o = 0;
+  for (const c of r.chunks) { all.set(c, o); o += c.length; }
+  return all;
+}
+
+function waitForEvent(target, name, timeoutMs) {
+  return new Promise(resolve => {
+    const done = () => { clearTimeout(timer); target.removeEventListener(name, done); resolve(); };
+    const timer = setTimeout(done, timeoutMs);
+    target.addEventListener(name, done);
+  });
+}
+
+function trainMs(train) {
+  return train.samples.length / train.sampleRate * 1000;
+}
+
+function makeBufferSource(train) {
+  const buffer = ctx.createBuffer(1, train.samples.length, train.sampleRate);
+  buffer.getChannelData(0).set(train.samples);
+  const src = ctx.createBufferSource();
+  src.buffer = buffer;
+  return src;
+}
+
+async function playWebAudio(train) {
+  const src = makeBufferSource(train);
+  src.connect(ctx.destination);
+  const ended = waitForEvent(src, 'ended', trainMs(train) + 3000);
+  src.start();
+  await ended;
+}
+
+async function playElement(train) {
+  el.srcObject = null;
+  el.src = makeWavUrl(train.samples, train.sampleRate);
+  const ended = waitForEvent(el, 'ended', trainMs(train) + 3000);
+  await el.play();
+  await ended;
+}
+
+async function playStreamDest(train) {
+  const dest = ctx.createMediaStreamDestination();
+  const src = makeBufferSource(train);
+  src.connect(dest);
+  el.removeAttribute('src');
+  el.srcObject = dest.stream;
+  await el.play();
+  const ended = waitForEvent(src, 'ended', trainMs(train) + 3000);
+  src.start();
+  await ended;
+  await waitMs(300); // let the <audio> element finish what it buffered
+  el.pause();
+  el.srcObject = null;
+}
+
+
+// ---------------------------------------------------------------------
+// Running a test
+// ---------------------------------------------------------------------
+let busy = false;
+
+function onPlay(test) {
+  if (busy) return;
+  busy = true;
+  setButtons(false);
+  // iOS only allows these directly inside the tap, so they come before any "await".
+  unlockElement();
+  stopMic();
+  el.pause();
+  const oldCtx = ctx;
+  setSession('auto');
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  ctx.resume();
+
+  runTest(test, oldCtx)
+    .catch(err => {
+      resultFor(test.id).note = 'error: ' + (err.name || '') + ' ' + (err.message || err);
+      setStatus(test.id, 'Error: ' + (err.message || err));
+    })
+    .finally(() => {
+      save();
+      render(test.id);
+      busy = false;
+      setButtons(true);
+    });
+}
+
+async function runTest(t, oldCtx) {
+  const r = resultFor(t.id);
+  r.listen = '';
+  r.note = '';
+  if (oldCtx) { try { await oldCtx.close(); } catch (e) { } }
+  setStatus(t.id, 'Getting ready…');
+
+  if (t.before) setSession(t.before);
+  if (t.mic) {
+    setStatus(t.id, 'Opening the microphone…');
+    micStream = await openMic(t.mic === 'raw');
+  }
+  if (t.after) setSession(t.after);
+  r.session = sessionType();
+
+  const train = makeTrain(ctx.sampleRate);
+  const listening = t.mic && t.during === 'on';
+  if (listening) startRecording();
+  if (t.during === 'disabled') setTracksEnabled(false);
+  if (t.during === 'stopped') stopMic();
+  await waitMs(200);
+
+  setStatus(t.id, 'Playing – listen!');
+  if (t.play === 'element') await playElement(train);
+  else if (t.play === 'streamdest') await playStreamDest(train);
+  else await playWebAudio(train);
+
+  if (listening) {
+    await waitMs(400);
+    const rec = stopRecording();
+    setStatus(t.id, 'Checking what the mic heard…');
+    await waitMs(30); // let the screen update first
+    r.listen = analyse(rec, train);
+  }
+  if (t.during === 'disabled') {
+    setTracksEnabled(true);
+    r.listen = 'n/a (mic paused)';
+  }
+  if (t.during === 'stopped') {
+    const t0 = performance.now();
+    micStream = await openMic(true);
+    r.note = 'mic reopened in ' + Math.round(performance.now() - t0) + ' ms';
+    r.listen = 'n/a (mic stopped)';
+  }
+  setStatus(t.id, 'Done – how loud was it?');
+}
+
+
+// ---------------------------------------------------------------------
+// Screen
+// ---------------------------------------------------------------------
+const RATINGS = [['loud', 'Loud'], ['quiet', 'Quiet'], ['none', 'No sound']];
+
+function buildTests() {
+  const box = document.getElementById('tests');
+  for (const t of TESTS) {
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.id = 'card-' + t.id;
+    let html = '<div class="head"><b>' + t.id + '. ' + escapeHtml(t.name) + '</b>' +
+               '<button class="play">Play</button></div>' +
+               '<div class="detail">' + escapeHtml(t.detail) + '</div>' +
+               '<div class="status" id="status-' + t.id + '"></div><div class="rate">';
+    for (const r of RATINGS) {
+      html += '<label><input type="radio" name="rate-' + t.id + '" value="' + r[0] + '">' + r[1] + '</label>';
+    }
+    html += '<label><input type="checkbox" class="ear">From the earpiece (top)</label></div>' +
+            '<div class="listen" id="listen-' + t.id + '"></div>';
+    card.innerHTML = html;
+    card.querySelector('.play').addEventListener('click', () => onPlay(t));
+    card.querySelectorAll('input[type=radio]').forEach(input => {
+      input.addEventListener('change', () => { resultFor(t.id).rating = input.value; save(); render(t.id); });
+    });
+    card.querySelector('.ear').addEventListener('change', e => {
+      resultFor(t.id).ear = e.target.checked; save();
+    });
+    box.appendChild(card);
+    render(t.id);
+  }
+}
+
+function render(id) {
+  const r = state.results[id];
+  const card = document.getElementById('card-' + id);
+  if (!r) return;
+  card.querySelectorAll('input[type=radio]').forEach(input => { input.checked = input.value === r.rating; });
+  card.querySelector('.ear').checked = r.ear;
+  card.classList.toggle('done', r.rating !== '');
+  const parts = [];
+  if (r.listen) parts.push('mic: ' + r.listen);
+  if (r.note) parts.push(r.note);
+  document.getElementById('listen-' + id).textContent = parts.join(' · ');
+}
+
+function setStatus(id, text) {
+  document.getElementById('status-' + id).textContent = text;
+}
+
+function setButtons(on) {
+  document.querySelectorAll('button.play').forEach(b => { b.disabled = !on; });
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// One line per test, e.g. "D: quiet+ear | heard 6/8, match 0.71, -42 dB | session play-and-record"
+function summary() {
+  const lines = [];
+  for (const t of TESTS) {
+    const r = state.results[t.id];
+    if (!r) { lines.push(t.id + ': -'); continue; }
+    let line = t.id + ': ' + (r.rating || '-') + (r.ear ? '+ear' : '');
+    if (r.listen) line += ' | ' + r.listen;
+    if (r.note) line += ' | ' + r.note;
+    if (r.session) line += ' | session ' + r.session;
+    lines.push(line);
+  }
+  lines.push(APP_VERSION + ', chirp ' + CHIRP_MS + ' ms');
+  return lines.join('\n');
+}
+
+function onSend() {
+  const text = summary();
+  document.getElementById('summary').textContent = text;
+  if (FORM_PREFILL.indexOf('=RESULTS') < 0) {
+    if (navigator.clipboard) navigator.clipboard.writeText(text).catch(() => { });
+    alert('No form is set up. The results are shown below the button – please take a screenshot.');
+    return;
+  }
+  const model = state.model || '(guess) ' + guessModel();
+  const url = FORM_PREFILL
+    .replace('=MODEL', '=' + encodeURIComponent(model))
+    .replace('=IOS', '=' + encodeURIComponent(iosVersion()))
+    .replace('=UA', '=' + encodeURIComponent(navigator.userAgent))
+    .replace('=RESULTS', '=' + encodeURIComponent(text))
+    .replace('=COMMENTS', '=' + encodeURIComponent(state.comments || ''));
+  location.href = url;
+}
+
+load();
+document.getElementById('guess').textContent = guessModel();
+document.getElementById('ios').textContent = iosVersion();
+const modelInput = document.getElementById('model');
+modelInput.value = state.model;
+modelInput.addEventListener('input', () => { state.model = modelInput.value; save(); });
+const commentsInput = document.getElementById('comments');
+commentsInput.value = state.comments;
+commentsInput.addEventListener('input', () => { state.comments = commentsInput.value; save(); });
+document.getElementById('reloadBtn').addEventListener('click', () => location.reload());
+document.getElementById('sendBtn').addEventListener('click', onSend);
+buildTests();
+</script>
+</body>
+</html>
